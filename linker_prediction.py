@@ -17,6 +17,7 @@ def get_sequence_pll(full_sequence, linker_start_idx, linker_length, model, toke
     """
     pll = 0.0
     sequence_list = list(full_sequence)
+    device = model.device # Dynamically grab the device the model is currently on
     
     for i in range(linker_length):
         target_idx = linker_start_idx + i
@@ -26,7 +27,9 @@ def get_sequence_pll(full_sequence, linker_start_idx, linker_length, model, toke
         sequence_list[target_idx] = tokenizer.mask_token
         masked_seq = "".join(sequence_list)
         
-        inputs = tokenizer(masked_seq, return_tensors="pt")
+        # Tokenize and send inputs to the same device as the model
+        inputs = tokenizer(masked_seq, return_tensors="pt").to(device)
+        
         with torch.no_grad():
             logits = model(**inputs).logits
             
@@ -49,9 +52,12 @@ def design_linker_gibbs(domain_a, domain_b, linker_length, num_seqs=10,
     """
     Generates multiple linker candidates using Gibbs Sampling and ranks them by overall PLL.
     """
-    print(f"Loading model: {model_name}...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading model: {model_name} on {device.type.upper()}...")
+    
     tokenizer = EsmTokenizer.from_pretrained(model_name)
-    model = EsmForMaskedLM.from_pretrained(model_name)
+    # Load model and immediately move to GPU (if available)
+    model = EsmForMaskedLM.from_pretrained(model_name).to(device)
     model.eval()
 
     candidates = []
@@ -75,7 +81,8 @@ def design_linker_gibbs(domain_a, domain_b, linker_length, num_seqs=10,
             for idx in mask_indices:
                 current_linker[idx] = tokenizer.mask_token
             full_sequence = domain_a + "".join(current_linker) + domain_b
-            inputs = tokenizer(full_sequence, return_tensors="pt")
+            
+            inputs = tokenizer(full_sequence, return_tensors="pt").to(device)
             
             with torch.no_grad():
                 logits = model(**inputs).logits
@@ -110,11 +117,8 @@ def design_linker_gibbs(domain_a, domain_b, linker_length, num_seqs=10,
             "pll": pll_score,
             'Method': 'gibbs'
         })
-        #print(f"Candidate {seq_idx+1}/{num_seqs}: {final_linker} (Score: {pll_score:.2f})")
-
 
     # 5. Rank the candidates from most probable to least probable
-    # (Higher PLL, i.e., closer to 0, is better)
     candidates.sort(key=lambda x: x["pll"], reverse=True)
     
     print("\n--- Top Candidates Ranked by Overall Sequence Probability (PLL) ---")
@@ -167,7 +171,6 @@ def read_fasta(filepath):
                         sequences.append("".join(current_seq))
                         current_seq = []
                 elif line:
-                    # Remove any whitespace or hidden characters from sequence lines
                     current_seq.append(line.replace(" ", ""))
             if current_seq:
                 sequences.append("".join(current_seq))
@@ -181,9 +184,11 @@ def design_linker(domain_a, domain_b, linker_length, model_name="facebook/esm2_t
     """
     Uses Meta's ESM-2 model to predict a linker sequence between two protein domains.
     """
-    print(f"Loading model: {model_name}...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading model: {model_name} on {device.type.upper()}...")
+    
     tokenizer = EsmTokenizer.from_pretrained(model_name)
-    model = EsmForMaskedLM.from_pretrained(model_name)
+    model = EsmForMaskedLM.from_pretrained(model_name).to(device)
     model.eval()
 
     masked_linker = "<mask>" * linker_length
@@ -192,7 +197,8 @@ def design_linker(domain_a, domain_b, linker_length, model_name="facebook/esm2_t
     print(f"\nInput Sequence (with {linker_length} masks):")
     print(full_sequence)
 
-    inputs = tokenizer(full_sequence, return_tensors="pt")
+    # Send inputs to GPU
+    inputs = tokenizer(full_sequence, return_tensors="pt").to(device)
     mask_token_indices = torch.where(inputs["input_ids"] == tokenizer.mask_token_id)[1]
 
     print("\nPredicting linker sequence...")
@@ -223,60 +229,51 @@ def design_linker_iterative(domain_a, domain_b, linker_length,
     It fills the most confident mask one at a time, allowing local dependencies to guide the folding.
     """
     if model is None or tokenizer is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if not silent:
-            print(f"Loading model: {model_name}...")
+            print(f"Loading model: {model_name} on {device.type.upper()}...")
         tokenizer = EsmTokenizer.from_pretrained(model_name)
-        model = EsmForMaskedLM.from_pretrained(model_name)
+        model = EsmForMaskedLM.from_pretrained(model_name).to(device)
         model.eval()
+    else:
+        device = model.device
 
-    # Represent the linker as a list so we can update individual positions
     current_linker = ["<mask>"] * linker_length
     if not silent:
         print(f"\nStarting iterative decoding for {linker_length} masks...")
 
-    # We need to do exactly as many passes as there are masks
     for step in range(linker_length):
-        # 1. Construct the current sequence
         full_sequence = domain_a + "".join(current_linker) + domain_b
-        inputs = tokenizer(full_sequence, return_tensors="pt")
         
-        # 2. Pass through the model
+        # Send inputs to GPU
+        inputs = tokenizer(full_sequence, return_tensors="pt").to(device)
+        
         with torch.no_grad():
             outputs = model(**inputs)
             logits = outputs.logits
         
-        # 3. Find where the masks currently are in the tokenized tensor
         mask_token_indices = torch.where(inputs["input_ids"] == tokenizer.mask_token_id)[1]
         
         best_confidence = -1.0
         best_token_id = -1
         linker_pos_to_update = -1
 
-        # Track the actual positions in our current_linker list that still need filling
         remaining_mask_positions = [idx for idx, val in enumerate(current_linker) if val == "<mask>"]
         
-        # 4. Evaluate confidence for every remaining mask
         for i, tensor_idx in enumerate(mask_token_indices):
-            # Convert raw logits to probabilities
             probs = F.softmax(logits[0, tensor_idx, :], dim=-1)
-            
-            # Find the highest probability token for this specific mask
             confidence, token_id = torch.max(probs, dim=-1)
             
-            # If this mask's top prediction is more confident than our previous best, save it
             if confidence.item() > best_confidence:
                 best_confidence = confidence.item()
                 best_token_id = token_id.item()
                 linker_pos_to_update = remaining_mask_positions[i]
         
-        # 5. Decode the winning token and update that single position in our linker list
         predicted_aa = tokenizer.decode([best_token_id]).strip()
         current_linker[linker_pos_to_update] = predicted_aa
         if not silent:
             print(f"Step {step+1}: Filled position {linker_pos_to_update+1} with '{predicted_aa}' (Confidence: {best_confidence:.4f})")
-            print(f"Current Linker: {''.join(current_linker)}")
 
-    # 6. Finalize the protein
     predicted_linker = "".join(current_linker)
     final_protein = domain_a + predicted_linker + domain_b
 
@@ -355,7 +352,6 @@ def main():
             writer.writeheader()
 
             if args.method == 'gibbs':
-                # Gibbs returns a list of dictionaries
                 for i, cand in enumerate(design):
                     writer.writerow({
                         'Method': cand['Method'],
@@ -365,17 +361,15 @@ def main():
                         'PLL_Score': round(cand['pll'], 4)
                     })
             else:
-                # Greedy and Iterative return a tuple: (linker, protein)
                 linker, protein = design
                 writer.writerow({
                     'Method': args.method.capitalize(),
                     'Rank': 1,
                     'Linker': linker,
                     'Full_Protein': protein,
-                    'PLL_Score': 'N/A'  # PLL isn't calculated by default for these methods
+                    'PLL_Score': 'N/A'  
                 })
         print(f"Successfully saved to {args.output}!")
-
 
 if __name__ == "__main__":
     main()
