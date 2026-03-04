@@ -107,9 +107,10 @@ def design_linker_gibbs(domain_a, domain_b, linker_length, num_seqs=10,
         candidates.append({
             "linker": final_linker,
             "protein": final_protein,
-            "pll": pll_score
+            "pll": pll_score,
+            'Method': 'gibbs'
         })
-        print(f"Candidate {seq_idx+1}/{num_seqs}: {final_linker} (Score: {pll_score:.2f})")
+        #print(f"Candidate {seq_idx+1}/{num_seqs}: {final_linker} (Score: {pll_score:.2f})")
 
 
     # 5. Rank the candidates from most probable to least probable
@@ -127,11 +128,26 @@ def design_linker_gibbs(domain_a, domain_b, linker_length, num_seqs=10,
                                                              tokenizer=tokenizer)
     
     pll_score_greedy = get_sequence_pll(greedy_sequence, linker_start_idx, linker_length, model, tokenizer)
+    candidates.append({
+            "linker": greedy_linker,
+            "protein": domain_a+greedy_linker+domain_b,
+            "pll": pll_score_greedy,
+            "Method": 'greedy'
+        })
+    
     exp_linker = 'SGGGGGGS'
     experimental_baseline = get_sequence_pll(domain_a+exp_linker+domain_b, linker_start_idx, len(exp_linker), model, tokenizer)
-
+    candidates.append({
+                "linker": exp_linker,
+                "protein": domain_a+exp_linker+domain_b,
+                "pll": experimental_baseline,
+                'Method': 'experimental baseline'
+            })
+    
     print(f"Greedy Baseline \t| PLL Score: {pll_score_greedy:>7.2f} | Linker: {greedy_linker}")
     print(f"Experiment Baseline \t| PLL Score: {experimental_baseline:>7.2f} | Linker: {exp_linker}")
+
+    candidates.sort(key=lambda x: x["pll"], reverse=True)
 
     return candidates
 
@@ -293,7 +309,9 @@ def main():
                         help="Number of Gibbs iterations per sequence (only for gibbs)")
     parser.add_argument("-t", "--temperature", type=float, default=1.0, 
                         help="Sampling temperature (1.0 is standard, >1.0 more random, <1.0 more strict)")
-
+    parser.add_argument("-o", "--output", type=str, 
+                        help="Path to save the generated sequences as a CSV file (e.g., results.csv)")
+    
     args = parser.parse_args()
 
     # Input validation logic (same as before)
@@ -317,15 +335,47 @@ def main():
     # Execution routing
     if args.method == 'gibbs':
         print("\nUsing GIBBS SAMPLING decoding method.")
-        design_linker_gibbs(domain_a, domain_b, args.length, 
+        design = design_linker_gibbs(domain_a, domain_b, args.length, 
                             num_seqs=args.num_seqs, masks_per_step=args.masks, 
                             steps=args.steps, temperature=args.temperature, model_name=args.model)
     elif args.method == 'iterative':
         print("\nUsing ITERATIVE decoding method.")
-        design_linker_iterative(domain_a, domain_b, args.length, model_name=args.model)
+        design = design_linker_iterative(domain_a, domain_b, args.length, model_name=args.model)
     else:
         print("\nUsing GREEDY decoding method.")
-        design_linker(domain_a, domain_b, args.length, model_name=args.model)
+        design = design_linker(domain_a, domain_b, args.length, model_name=args.model)
+
+    if args.output:
+        import csv
+        
+        print(f"\nSaving results to {args.output}...")
+        with open(args.output, mode='w', newline='') as csv_file:
+            fieldnames = ['Method', 'Rank', 'Linker', 'Full_Protein', 'PLL_Score']
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+
+            if args.method == 'gibbs':
+                # Gibbs returns a list of dictionaries
+                for i, cand in enumerate(design):
+                    writer.writerow({
+                        'Method': cand['Method'],
+                        'Rank': i + 1,
+                        'Linker': cand['linker'],
+                        'Full_Protein': cand['protein'],
+                        'PLL_Score': round(cand['pll'], 4)
+                    })
+            else:
+                # Greedy and Iterative return a tuple: (linker, protein)
+                linker, protein = design
+                writer.writerow({
+                    'Method': args.method.capitalize(),
+                    'Rank': 1,
+                    'Linker': linker,
+                    'Full_Protein': protein,
+                    'PLL_Score': 'N/A'  # PLL isn't calculated by default for these methods
+                })
+        print(f"Successfully saved to {args.output}!")
+
 
 if __name__ == "__main__":
     main()
